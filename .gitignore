@@ -8,3 +8,6 @@ mlruns/
 .ipynb_checkpoints/
 .DS_Store
 logs/
+mlflow_artifacts/
+mlflow_artifacts/
+custormer_churn/
