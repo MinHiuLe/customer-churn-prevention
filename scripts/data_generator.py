@@ -160,7 +160,7 @@ def generate_drift_dataset(n_users: int = 2000, week: int = 1) -> pd.DataFrame:
         )
 
         print(f"Week {week}: Concept drift applied to {young_mask.sum()} young users ⚠️")
-
+    
     df['week'] = week
     return df
 

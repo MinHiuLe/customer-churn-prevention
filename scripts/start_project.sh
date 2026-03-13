@@ -79,11 +79,15 @@ python src/decision_engine.py > /dev/null 2>&1
 echo "Decision Engine done ✅"
 
 # 6. Streamlit
-echo "📱 Starting Streamlit Dashboard..."
-streamlit run src/dashboard/app.py \
-  --server.port 8501 \
-  --server.headless true &
-echo $! > /tmp/streamlit.pid
+if ! lsof -i:8501 > /dev/null 2>&1; then
+  echo "📱 Starting Streamlit Dashboard..."
+  streamlit run src/dashboard/app.py \
+    --server.port 8501 \
+    --server.headless true &
+  echo $! > /tmp/streamlit.pid
+else
+  echo "📱 Streamlit already running on :8501"
+fi
 
 echo ""
 echo "✅ All services started!"
