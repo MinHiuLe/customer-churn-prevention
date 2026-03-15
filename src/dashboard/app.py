@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -332,17 +333,51 @@ elif page == "📈 Model Performance":
     else:
         st.info("SHAP data not found at data/processed/shap_importance.csv")
 
-    # Model comparison table
+    # Model Registry — pull từ MLflow thật
     st.subheader("Model Registry")
-    model_df = pd.DataFrame({
-        'Model': ['LightGBM Churn', 'CoxPH Survival', 'T-Learner Uplift'],
-        'Version': ['v1.0', 'v1.0', 'v1.0'],
-        'Metric': ['AUC-ROC', 'C-index', 'AUUC'],
-        'Score': [0.8445, 0.9415, 0.2014],
-        'Status': ['✅ Production', '✅ Production', '✅ Production'],
-        'Trained': ['2026-03-09', '2026-03-09', '2026-03-09'],
-    })
-    st.dataframe(model_df, use_container_width=True, hide_index=True)
+    try:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        client = MlflowClient(os.getenv('MLFLOW_TRACKING_URI', 'http://localhost:5000'))
+        exp = client.get_experiment_by_name('churn-prediction')
+        runs = client.search_runs(
+            experiment_ids=[exp.experiment_id],
+            order_by=['start_time DESC']
+        )
+
+        rows = []
+        for run in runs:
+            name = run.info.run_name
+            metrics = run.data.metrics
+            tags = run.data.tags
+            start = run.info.start_time
+            trained = pd.Timestamp(start, unit='ms').strftime('%Y-%m-%d %H:%M') if start else 'N/A'
+            promoted = tags.get('promoted', 'true')
+            status = '✅ Production' if promoted != 'false' else '🔄 Not promoted'
+
+            if 'lightgbm' in name:
+                rows.append({'Model': name, 'Metric': 'AUC-ROC',
+                             'Score': round(metrics.get('auc_roc', 0), 4),
+                             'Status': status, 'Trained': trained,
+                             'Run ID': run.info.run_id[:8]})
+            elif 'coxph' in name:
+                rows.append({'Model': name, 'Metric': 'C-index',
+                             'Score': round(metrics.get('c_index', 0), 4),
+                             'Status': status, 'Trained': trained,
+                             'Run ID': run.info.run_id[:8]})
+            elif 'uplift' in name:
+                rows.append({'Model': name, 'Metric': 'AUUC',
+                             'Score': round(metrics.get('auuc', 0), 4),
+                             'Status': status, 'Trained': trained,
+                             'Run ID': run.info.run_id[:8]})
+
+        if rows:
+            model_df = pd.DataFrame(rows)
+            st.dataframe(model_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No runs found in MLflow")
+    except Exception as e:
+        st.error(f"Cannot connect to MLflow: {e}")
 
 # ─── PAGE 5: Drift Monitor ────────────────────────────────────────────────────
 elif page == "⚠️  Drift Monitor":
