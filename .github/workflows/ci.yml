@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +23,86 @@ jobs:
           pip install fastapi uvicorn lightgbm shap \
             pandas numpy scikit-learn lifelines scipy==1.11.4 \
             joblib pyarrow pytest httpx
+
+      - name: Create mock model files for CI
+        run: |
+          mkdir -p data/processed/models
+          python3 << 'PYEOF'
+          import json, joblib, numpy as np
+          from pathlib import Path
+          from sklearn.pipeline import Pipeline
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.linear_model import LogisticRegression
+          import lightgbm as lgb
+
+          MODEL_DIR = Path('data/processed/models')
+
+          # Feature cols
+          feature_cols = [
+              'tenure', 'SeniorCitizen', 'MonthlyCharges', 'TotalCharges',
+              'Partner', 'Dependents', 'PhoneService', 'PaperlessBilling',
+              'MultipleLines', 'OnlineSecurity', 'OnlineBackup',
+              'DeviceProtection', 'TechSupport', 'StreamingTV', 'StreamingMovies',
+              'Contract_encoded', 'InternetService_encoded', 'PaymentMethod_encoded',
+              'recency_risk', 'service_count', 'monetary_value',
+              'monthly_to_total_ratio', 'charge_per_month', 'clv_proxy',
+              'is_high_value', 'contract_stability', 'digital_engagement'
+          ]
+          with open(MODEL_DIR / 'feature_cols.json', 'w') as f:
+              json.dump(feature_cols, f)
+
+          # Mock LightGBM
+          from sklearn.datasets import make_classification
+          X, y = make_classification(n_samples=200, n_features=27, random_state=42)
+          train_data = lgb.Dataset(X, label=y)
+          params = {'objective': 'binary', 'num_leaves': 4,
+                    'n_estimators': 5, 'verbose': -1}
+          mock_lgbm = lgb.train(params, train_data, num_boost_round=5)
+          mock_lgbm.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
+
+          # Mock CoxPH
+          from lifelines import CoxPHFitter
+          import pandas as pd
+          df_surv = pd.DataFrame({
+              'tenure': np.random.randint(1, 72, 200),
+              'MonthlyCharges': np.random.uniform(20, 100, 200),
+              'InternetService_encoded': np.random.randint(0, 3, 200),
+              'Contract_encoded': np.random.randint(0, 3, 200),
+              'SeniorCitizen': np.random.randint(0, 2, 200),
+              'service_count': np.random.randint(0, 8, 200),
+              'charge_per_month': np.random.uniform(0, 50, 200),
+              'digital_engagement': np.random.randint(0, 3, 200),
+              'Churn_binary': np.random.randint(0, 2, 200),
+          })
+          cph = CoxPHFitter(penalizer=0.1)
+          cph.fit(df_surv, duration_col='tenure', event_col='Churn_binary')
+          joblib.dump(cph, MODEL_DIR / 'coxph_model.pkl')
+
+          # Mock T-Learner
+          uplift_cols = ['tenure', 'monthly_charges', 'contract_type',
+                         'service_count', 'clv_proxy', 'senior_citizen',
+                         'has_partner', 'digital_engagement']
+          X_up = np.random.randn(200, 8)
+          y_up = np.random.randint(0, 2, 200)
+          t0 = LogisticRegression().fit(X_up, y_up)
+          t1 = LogisticRegression().fit(X_up, y_up)
+          joblib.dump(t0, MODEL_DIR / 'uplift_t0.pkl')
+          joblib.dump(t1, MODEL_DIR / 'uplift_t1.pkl')
+
+          # Mock batch scores
+          Path('data/processed').mkdir(parents=True, exist_ok=True)
+          pd.DataFrame({
+              'user_id': range(100),
+              'churn_probability': np.random.uniform(0, 1, 100),
+              'uplift_score': np.random.uniform(-0.5, 0.5, 100),
+              'segment': np.random.choice(
+                  ['Persuadable','Sure_Thing','Lost_Cause','Sleeping_Dog'], 100),
+              'clv_proxy': np.random.uniform(100, 1000, 100),
+              'scored_at': '2026-01-01',
+          }).to_csv('data/processed/batch_scores_latest.csv', index=False)
+
+          print("Mock models created ✅")
+          PYEOF
 
       - name: Run tests
         run: pytest tests/ -v --tb=short
