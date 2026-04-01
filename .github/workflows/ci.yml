@@ -22,7 +22,7 @@ jobs:
         run: |
           pip install fastapi uvicorn lightgbm shap \
             pandas numpy scikit-learn lifelines scipy==1.11.4 \
-            joblib pyarrow pytest httpx
+            joblib pyarrow pytest httpx psycopg2-binary
 
       - name: Create mock model files for CI
         run: |
