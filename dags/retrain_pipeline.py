@@ -56,7 +56,7 @@ def retrain_model(**context):
         'verbose': -1,
     }
 
-    mlflow.set_tracking_uri('http://localhost:5000')
+    mlflow.set_tracking_uri(os.getenv('MLFLOW_TRACKING_URI', 'http://mlflow:5000'))
     mlflow.set_experiment('churn-prediction')
 
     with mlflow.start_run(run_name=f'retrain_{datetime.now().strftime("%Y%m%d_%H%M")}'):
