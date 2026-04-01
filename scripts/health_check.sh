@@ -159,7 +159,7 @@ python3 -c "
 import mlflow, os
 from dotenv import load_dotenv
 load_dotenv()
-mlflow.set_tracking_uri("http://localhost:5000"'))
+mlflow.set_tracking_uri('http://localhost:5000')
 client = mlflow.tracking.MlflowClient()
 exp = client.get_experiment_by_name('churn-prediction')
 if exp:
