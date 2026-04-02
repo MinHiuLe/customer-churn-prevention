@@ -11,3 +11,4 @@ logs/
 mlflow_artifacts/
 mlflow_artifacts/
 custormer_churn/
+data/raw/
