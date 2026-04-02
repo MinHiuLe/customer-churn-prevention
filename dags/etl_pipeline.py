@@ -1,11 +1,10 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, timedelta
 import pandas as pd
-import numpy as np
 import redis
 import json
-import psycopg2
 import os
 
 default_args = {
@@ -15,140 +14,89 @@ default_args = {
 }
 
 def get_pg_conn():
-    return psycopg2.connect(
-        host=os.getenv('POSTGRES_HOST', 'postgres'),
-        port=os.getenv('POSTGRES_PORT', 5432),
-        dbname=os.getenv('POSTGRES_DB', 'churn_db'),
-        user=os.getenv('POSTGRES_USER', 'churn_user'),
-        password=os.getenv('POSTGRES_PASSWORD', 'churn_pass'),
-    )
+    return PostgresHook(postgres_conn_id='churn_postgres_conn').get_conn()
 
-def data_quality_check(**context):
-    """Load từ PostgreSQL và validate"""
+def data_validation(**context):
     conn = get_pg_conn()
-    df = pd.read_sql("SELECT * FROM customers", conn)
+    df   = pd.read_sql("SELECT * FROM customers", conn)
     conn.close()
 
-    assert len(df) > 0, "No customers in database"
-    assert df['tenure'].min() >= 0, "Negative tenure detected"
-    assert df['monthly_charges'].between(0, 200).all(), "MonthlyCharges out of range"
-    null_rate = df.isnull().sum() / len(df)
-    assert (null_rate < 0.10).all(), f"Null rate too high: {null_rate[null_rate >= 0.10]}"
+    if len(df) == 0:
+        raise ValueError("Data Validation Failed: Database is empty")
 
-    print(f"Data quality check passed ✅ — {len(df)} customers in DB")
+    null_counts = df.isnull().sum().sum()
+    churn_rate  = df['churn_binary'].mean()
+    avg_monthly = df['monthly_charges'].mean()
+
+    print("-" * 40)
+    print("DATA HEALTH REPORT")
+    print("-" * 40)
+    print(f"Total records:    {len(df)}")
+    print(f"Churn rate:       {churn_rate:.2%}")
+    print(f"Avg monthly:      ${avg_monthly:.2f}")
+    print(f"Total nulls:      {null_counts}")
+    print("-" * 40)
+
+    if churn_rate > 0.8:
+        raise ValueError(f"Churn rate too high: {churn_rate:.2%}")
+    if null_counts / (len(df) * len(df.columns)) > 0.05:
+        raise ValueError(f"Null rate too high: {null_counts}")
+
     return len(df)
 
-def compute_and_save_features(**context):
-    """ETL: PostgreSQL → feature engineering → save back to PostgreSQL"""
+def compute_features(**context):
     conn = get_pg_conn()
-    df = pd.read_sql("SELECT * FROM customers", conn)
+    df   = pd.read_sql("SELECT * FROM customers", conn)
     conn.close()
 
-    # Rename columns để match feature engineering
     df = df.rename(columns={
-        'customer_id': 'customerID',
-        'senior_citizen': 'SeniorCitizen',
-        'partner': 'Partner',
-        'dependents': 'Dependents',
-        'phone_service': 'PhoneService',
-        'multiple_lines': 'MultipleLines',
-        'internet_service': 'InternetService_encoded',
-        'online_security': 'OnlineSecurity',
-        'online_backup': 'OnlineBackup',
-        'device_protection': 'DeviceProtection',
-        'tech_support': 'TechSupport',
-        'streaming_tv': 'StreamingTV',
-        'streaming_movies': 'StreamingMovies',
-        'contract_encoded': 'Contract_encoded',
-        'paperless_billing': 'PaperlessBilling',
+        'customer_id':          'customerID',
+        'senior_citizen':       'SeniorCitizen',
+        'partner':              'Partner',
+        'dependents':           'Dependents',
+        'phone_service':        'PhoneService',
+        'multiple_lines':       'MultipleLines',
+        'internet_service':     'InternetService_encoded',
+        'online_security':      'OnlineSecurity',
+        'online_backup':        'OnlineBackup',
+        'device_protection':    'DeviceProtection',
+        'tech_support':         'TechSupport',
+        'streaming_tv':         'StreamingTV',
+        'streaming_movies':     'StreamingMovies',
+        'contract_encoded':     'Contract_encoded',
+        'paperless_billing':    'PaperlessBilling',
         'payment_method_encoded': 'PaymentMethod_encoded',
-        'monthly_charges': 'MonthlyCharges',
-        'total_charges': 'TotalCharges',
-        'churn_binary': 'Churn_binary',
+        'monthly_charges':      'MonthlyCharges',
+        'total_charges':        'TotalCharges',
+        'churn_binary':         'Churn_binary',
     })
 
-    # Feature Engineering
     service_cols = ['PhoneService', 'MultipleLines', 'OnlineSecurity',
                     'OnlineBackup', 'DeviceProtection', 'TechSupport',
                     'StreamingTV', 'StreamingMovies']
-    df['recency_risk'] = 1 / (df['tenure'] + 1)
-    df['service_count'] = df[service_cols].sum(axis=1)
-    df['charge_per_month'] = df['MonthlyCharges'] / (df['tenure'] + 1)
-    df['clv_proxy'] = df['TotalCharges'] * (1 - df['recency_risk'])
-    df['is_high_value'] = (df['clv_proxy'] > df['clv_proxy'].quantile(0.75)).astype(int)
-    df['contract_stability'] = df['Contract_encoded'] * df['tenure']
-    df['digital_engagement'] = (
+
+    df['recency_risk']         = 1 / (df['tenure'] + 1)
+    df['service_count']        = df[service_cols].sum(axis=1)
+    df['charge_per_month']     = df['MonthlyCharges'] / (df['tenure'] + 1)
+    df['clv_proxy']            = df['TotalCharges'] * (1 - df['recency_risk'])
+    df['is_high_value']        = (df['clv_proxy'] > df['clv_proxy'].quantile(0.75)).astype(int)
+    df['contract_stability']   = df['Contract_encoded'] * df['tenure']
+    df['digital_engagement']   = (
         df['PaperlessBilling'] +
         df['PaymentMethod_encoded'].apply(lambda x: 1 if x >= 2 else 0)
     )
     df['monthly_to_total_ratio'] = df['MonthlyCharges'] / (df['TotalCharges'] + 1)
-    df['monetary_value'] = df['TotalCharges']
+    df['monetary_value']         = df['TotalCharges']
 
-    # Save features back to PostgreSQL
-    conn = get_pg_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS customer_features (
-            customer_id VARCHAR(50) PRIMARY KEY,
-            tenure FLOAT, senior_citizen INT, partner INT, dependents INT,
-            phone_service INT, multiple_lines INT, online_security INT,
-            online_backup INT, device_protection INT, tech_support INT,
-            streaming_tv INT, streaming_movies INT, contract_encoded INT,
-            paperless_billing INT, payment_method_encoded INT,
-            monthly_charges FLOAT, total_charges FLOAT,
-            internet_service_encoded INT, churn_binary INT,
-            recency_risk FLOAT, service_count INT, charge_per_month FLOAT,
-            clv_proxy FLOAT, is_high_value INT, contract_stability FLOAT,
-            digital_engagement INT, monthly_to_total_ratio FLOAT,
-            monetary_value FLOAT, updated_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-
-    for _, row in df.iterrows():
-        cur.execute("""
-            INSERT INTO customer_features VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,%s,%s,%s,%s, NOW()
-            ) ON CONFLICT (customer_id) DO UPDATE SET
-                tenure=EXCLUDED.tenure,
-                monthly_charges=EXCLUDED.monthly_charges,
-                clv_proxy=EXCLUDED.clv_proxy,
-                recency_risk=EXCLUDED.recency_risk,
-                charge_per_month=EXCLUDED.charge_per_month,
-                contract_stability=EXCLUDED.contract_stability,
-                updated_at=NOW()
-        """, (
-            row['customerID'], row['tenure'],
-            int(row['SeniorCitizen']), int(row['Partner']),
-            int(row['Dependents']), int(row['PhoneService']),
-            int(row['MultipleLines']), int(row['OnlineSecurity']),
-            int(row['OnlineBackup']), int(row['DeviceProtection']),
-            int(row['TechSupport']), int(row['StreamingTV']),
-            int(row['StreamingMovies']), int(row['Contract_encoded']),
-            int(row['PaperlessBilling']), int(row['PaymentMethod_encoded']),
-            float(row['MonthlyCharges']), float(row['TotalCharges']),
-            int(row['InternetService_encoded']), int(row['Churn_binary']),
-            float(row['recency_risk']), int(row['service_count']),
-            float(row['charge_per_month']), float(row['clv_proxy']),
-            int(row['is_high_value']), float(row['contract_stability']),
-            int(row['digital_engagement']), float(row['monthly_to_total_ratio']),
-            float(row['monetary_value']),
-        ))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    # Also save CSV for batch scoring compatibility
-    df.to_csv('/opt/airflow/data/processed/features_latest.csv', index=False)
-    print(f"Features saved to PostgreSQL + CSV ✅ — {len(df)} customers")
+    # Save to CSV for DVC tracking
+    csv_path = '/opt/airflow/data/processed/features_latest.csv'
+    df.to_csv(csv_path, index=False)
+    print(f"Features saved to CSV ✅ — {len(df)} rows")
     return len(df)
 
-def push_to_feature_store(**context):
-    """PostgreSQL features → Redis Feature Store"""
+def push_to_redis(**context):
     conn = get_pg_conn()
-    df = pd.read_sql("SELECT * FROM customer_features", conn)
+    df   = pd.read_sql("SELECT * FROM customer_features", conn)
     conn.close()
 
     r = redis.Redis(
@@ -160,10 +108,10 @@ def push_to_feature_store(**context):
     pushed = 0
     for _, row in df.iterrows():
         features = row.to_dict()
-        features.pop('customer_id', None)
+        cust_id  = features.pop('customer_id')
         features.pop('updated_at', None)
         r.setex(
-            f"features:{row['customer_id']}",
+            f"features:{cust_id}",
             86400,
             json.dumps({k: float(v) if v is not None else 0.0
                        for k, v in features.items()})
@@ -172,30 +120,22 @@ def push_to_feature_store(**context):
 
     r.set('feature_store:last_updated', datetime.now().isoformat())
     r.set('feature_store:row_count', pushed)
-    print(f"Pushed {pushed} users to Redis ✅")
-    return pushed
+    print(f"Pushed {pushed} customers to Redis ✅")
 
 with DAG(
     'etl_pipeline',
     default_args=default_args,
-    description='Daily ETL: PostgreSQL → feature engineering → Redis',
+    description='ETL: Validate → Feature Engineering → Redis sync',
     schedule_interval='0 2 * * *',
     start_date=datetime(2026, 1, 1),
     catchup=False,
+    max_active_runs=1,
+    dagrun_timeout=timedelta(hours=1),
     tags=['etl', 'features'],
 ) as dag:
 
-    quality_check = PythonOperator(
-        task_id='data_quality_check',
-        python_callable=data_quality_check,
-    )
-    feature_engineering = PythonOperator(
-        task_id='compute_features',
-        python_callable=compute_and_save_features,
-    )
-    redis_push = PythonOperator(
-        task_id='push_to_feature_store',
-        python_callable=push_to_feature_store,
-    )
+    validate  = PythonOperator(task_id='data_validation',  python_callable=data_validation)
+    transform = PythonOperator(task_id='compute_features', python_callable=compute_features)
+    sync      = PythonOperator(task_id='sync_to_redis',    python_callable=push_to_redis)
 
-    quality_check >> feature_engineering >> redis_push
+    validate >> transform >> sync

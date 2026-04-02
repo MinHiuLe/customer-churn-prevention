@@ -1,9 +1,9 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, timedelta
-import psycopg2
 import random
-import os
 import uuid
 
 default_args = {
@@ -13,18 +13,10 @@ default_args = {
 }
 
 def generate_customers(**context):
-    """Sinh 50-100 customers mới mỗi ngày và insert vào PostgreSQL"""
+    hook = PostgresHook(postgres_conn_id='churn_postgres_conn')
+    conn = hook.get_conn()
+    cur  = conn.cursor()
 
-    conn = psycopg2.connect(
-        host=os.getenv('POSTGRES_HOST', 'postgres'),
-        port=os.getenv('POSTGRES_PORT', 5432),
-        dbname=os.getenv('POSTGRES_DB', 'churn_db'),
-        user=os.getenv('POSTGRES_USER', 'churn_user'),
-        password=os.getenv('POSTGRES_PASSWORD', 'churn_pass'),
-    )
-    cur = conn.cursor()
-
-    # Ensure table exists
     cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (
             customer_id VARCHAR(50) PRIMARY KEY,
@@ -40,35 +32,35 @@ def generate_customers(**context):
     """)
 
     n_new = random.randint(50, 100)
-    inserted = 0
+    is_competitor_attack = random.random() < 0.2
+
+    if is_competitor_attack:
+        print("⚠️  Concept drift: Simulating competitor promotion")
 
     for _ in range(n_new):
-        # Causal data generation
         contract = random.choices([0, 1, 2], weights=[0.55, 0.25, 0.20])[0]
         internet = random.choices([0, 1, 2], weights=[0.20, 0.35, 0.45])[0]
-        tenure = max(0, int(random.gauss(32, 24)))
-        senior = random.choices([0, 1], weights=[0.84, 0.16])[0]
+        tenure   = max(0, int(random.gauss(32, 24)))
+        senior   = random.choices([0, 1], weights=[0.84, 0.16])[0]
 
-        # Monthly charges correlated with internet service
         base_charge = {0: 25, 1: 55, 2: 80}[internet]
-        monthly = round(base_charge + random.gauss(0, 10), 2)
-        monthly = max(20, min(120, monthly))
-        total = round(monthly * max(tenure, 1) * random.uniform(0.9, 1.1), 2)
+        monthly = round(max(20, min(120, base_charge + random.gauss(0, 10))), 2)
+        total   = round(monthly * max(tenure, 1) * random.uniform(0.9, 1.1), 2)
+        services = [random.randint(0, 1) for _ in range(8)]
 
-        # Services
-        services = [random.randint(0,1) for _ in range(8)]
-
-        # Churn probability — causal model
         churn_prob = 0.3
-        if contract == 0: churn_prob += 0.25
-        if contract == 2: churn_prob -= 0.20
-        if internet == 2: churn_prob += 0.15
-        if tenure > 48: churn_prob -= 0.20
-        if tenure < 6: churn_prob += 0.15
-        if senior: churn_prob += 0.05
-        churn_prob = max(0.02, min(0.95, churn_prob))
-        churn = 1 if random.random() < churn_prob else 0
+        if contract == 0:  churn_prob += 0.25
+        if contract == 2:  churn_prob -= 0.20
+        if internet == 2:  churn_prob += 0.15
+        if tenure > 48:    churn_prob -= 0.20
+        if tenure < 6:     churn_prob += 0.15
+        if senior:         churn_prob += 0.05
+        if is_competitor_attack:
+            if internet == 2 and monthly > 70: churn_prob += 0.35
+            if not senior and tenure < 12:     churn_prob += 0.25
 
+        churn_prob  = max(0.02, min(0.95, churn_prob))
+        churn       = 1 if random.random() < churn_prob else 0
         customer_id = f"FAKE_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:8].upper()}"
 
         cur.execute("""
@@ -82,38 +74,28 @@ def generate_customers(**context):
             ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (customer_id) DO NOTHING
         """, (
-            customer_id, senior,
-            random.randint(0,1), random.randint(0,1),
-            tenure,
-            services[0], services[1], internet,
-            services[2], services[3], services[4],
-            services[5], services[6], services[7],
-            contract, random.randint(0,1),
-            random.randint(0,3),
-            monthly, total, churn
+            customer_id, senior, random.randint(0,1), random.randint(0,1),
+            tenure, services[0], services[1], internet,
+            services[2], services[3], services[4], services[5],
+            services[6], services[7], contract, random.randint(0,1),
+            random.randint(0,3), monthly, total, churn
         ))
-        inserted += 1
 
     conn.commit()
-
-    # Log total count
-    cur.execute("SELECT COUNT(*) FROM customers")
-    total_count = cur.fetchone()[0]
-
     cur.close()
     conn.close()
-
-    print(f"Inserted {inserted} new customers ✅")
-    print(f"Total customers in DB: {total_count}")
-    return inserted
+    print(f"Generated {n_new} customers ✅")
+    return n_new
 
 with DAG(
     'faker_data_generator',
     default_args=default_args,
-    description='Daily: generate synthetic customers → PostgreSQL',
-    schedule_interval='0 1 * * *',  # 1AM — trước ETL
+    description='Generate synthetic customers → trigger ETL',
+    schedule_interval='0 1 * * *',
     start_date=datetime(2026, 1, 1),
     catchup=False,
+    max_active_runs=1,
+    dagrun_timeout=timedelta(hours=1),
     tags=['data', 'faker'],
 ) as dag:
 
@@ -121,3 +103,11 @@ with DAG(
         task_id='generate_customers',
         python_callable=generate_customers,
     )
+
+    trigger_etl = TriggerDagRunOperator(
+        task_id='trigger_etl',
+        trigger_dag_id='etl_pipeline',
+        conf={"reason": "new_data_available"},
+    )
+
+    generate >> trigger_etl
