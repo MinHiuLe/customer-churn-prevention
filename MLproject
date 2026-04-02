@@ -1,0 +1,33 @@
+name: customer-churn-prevention
+
+python_env: python_env.yaml
+
+entry_points:
+  train:
+    parameters:
+      num_leaves:       {type: int,   default: 31}
+      learning_rate:    {type: float, default: 0.05}
+      feature_fraction: {type: float, default: 0.9}
+      bagging_fraction: {type: float, default: 0.8}
+      bagging_freq:     {type: int,   default: 5}
+      threshold:        {type: float, default: 0.446}
+      test_size:        {type: float, default: 0.2}
+    command: >
+      python src/mlops/train_entry.py
+        --num_leaves {num_leaves}
+        --learning_rate {learning_rate}
+        --feature_fraction {feature_fraction}
+        --bagging_fraction {bagging_fraction}
+        --bagging_freq {bagging_freq}
+        --threshold {threshold}
+        --test_size {test_size}
+
+  evaluate:
+    parameters:
+      model_version: {type: string, default: "champion"}
+    command: >
+      python src/mlops/evaluate_entry.py
+        --model_version {model_version}
+
+  full_pipeline:
+    command: python scripts/mlflow_enterprise.py

@@ -48,7 +48,9 @@ def train_and_log(X_train, X_test, y_train, y_test,
         silent=False,
     )
 
-    with mlflow.start_run(run_name=run_name) as run:
+    active_run = mlflow.active_run()
+    nested = active_run is not None
+    with mlflow.start_run(run_name=run_name, nested=nested) as run:
         train_data = lgb.Dataset(X_train, label=y_train)
         val_data   = lgb.Dataset(X_test,  label=y_test)
 

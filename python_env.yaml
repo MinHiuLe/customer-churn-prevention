@@ -1,0 +1,14 @@
+python: "3.12"
+build_dependencies:
+  - pip
+dependencies:
+  - lightgbm==4.6.0
+  - mlflow>=2.9.0
+  - pandas==2.2.0
+  - numpy==1.26.4
+  - scikit-learn==1.4.0
+  - lifelines==0.28.0
+  - scipy==1.11.4
+  - joblib
+  - python-dotenv
+  - dagshub
