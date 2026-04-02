@@ -10,6 +10,16 @@ import os
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
+import sys
+sys.path.insert(0, '/opt/airflow')
+from src.mlops.model_registry import (
+    register_model, champion_challenger
+)
+import sys
+sys.path.insert(0, '/opt/airflow')
+from src.mlops.model_registry import (
+    register_model, champion_challenger
+)
 
 default_args = {
     'owner': 'churn_team',
@@ -72,14 +82,22 @@ def retrain_model(**context):
         mlflow.log_metric('auc_roc', auc)
         mlflow.log_params(params)
 
-        baseline_auc = 0.8445
-        if auc > baseline_auc:
-            model.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
-            mlflow.set_tag('promoted', 'true')
-            print(f"New model promoted ✅ AUC: {auc:.4f} > {baseline_auc}")
-        else:
-            mlflow.set_tag('promoted', 'false')
-            print(f"Model NOT promoted — AUC: {auc:.4f} < {baseline_auc}")
+        run_id = mlflow.active_run().info.run_id
+
+        # Register + Champion/Challenger via enterprise module
+        try:
+            version  = register_model(run_id, version_alias='staging')
+            promoted = champion_challenger(version, auc)
+            mlflow.set_tag('promoted', str(promoted).lower())
+            if promoted:
+                model.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
+                print(f"New model promoted ✅ AUC: {auc:.4f}")
+            else:
+                print(f"Model NOT promoted — AUC: {auc:.4f}")
+        except Exception as e:
+            print(f"Registry error (non-critical): {e}")
+            if auc > 0.8445:
+                model.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
 
         drift_flag = '/opt/airflow/data/processed/drift_detected.flag'
         if os.path.exists(drift_flag):
