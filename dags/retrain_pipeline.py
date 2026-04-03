@@ -12,7 +12,10 @@ import hashlib
 import subprocess
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, precision_recall_curve, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    roc_auc_score, precision_recall_curve,
+    f1_score, precision_score, recall_score,
+)
 import sys
 
 sys.path.insert(0, '/opt/airflow')
@@ -28,11 +31,15 @@ MODEL_DIR = Path('/opt/airflow/data/processed/models')
 CSV_PATH  = '/opt/airflow/data/processed/features_latest.csv'
 DVC_PATH  = '/opt/airflow/data/processed/features_latest.csv.dvc'
 
+# Threshold minimum untuk promote ke production — diambil dari env agar
+# mudah diubah tanpa menyentuh kode.
+MIN_AUC_TO_PROMOTE = float(os.getenv('MIN_AUC_TO_PROMOTE', '0.84'))
+
+
 def check_drift_trigger(**context):
     drift_flag = '/opt/airflow/data/processed/drift_detected.flag'
-    if os.path.exists(drift_flag):
-        return True
-    return False
+    return os.path.exists(drift_flag)
+
 
 def validate_dvc_hash(**context):
     trigger = context['task_instance'].xcom_pull(task_ids='check_drift')
@@ -61,12 +68,13 @@ def validate_dvc_hash(**context):
     if actual_md5 != expected_md5:
         raise ValueError(
             f"Ghost Data detected!\n"
-            f"DVC expected: {expected_md5}\n"
-            f"Actual file:  {actual_md5}\n"
+            f"DVC expected : {expected_md5}\n"
+            f"Actual file  : {actual_md5}\n"
             f"Run 'dvc add' + 'git commit' before retrain."
         )
 
     return True
+
 
 def retrain_model(**context):
     trigger = context['task_instance'].xcom_pull(task_ids='check_drift')
@@ -98,7 +106,6 @@ def retrain_model(**context):
 
     mlflow.set_tracking_uri(os.getenv('MLFLOW_TRACKING_URI'))
     mlflow.set_experiment('churn-prediction')
-
     mlflow.lightgbm.autolog(
         log_input_examples=True,
         log_model_signatures=True,
@@ -116,27 +123,26 @@ def retrain_model(**context):
             params, train_data,
             num_boost_round=500,
             valid_sets=[val_data],
-            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)]
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)],
         )
 
-        # Tính toán metric chi tiết
+        # Tính toán metrics và threshold tối ưu
         y_pred_proba = model.predict(X_test)
-        auc = roc_auc_score(y_test, y_pred_proba)
-        
-        # Tìm threshold tối ưu dựa trên F1
+        auc          = roc_auc_score(y_test, y_pred_proba)
+
         precisions, recalls, thresholds = precision_recall_curve(y_test, y_pred_proba)
-        f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
-        best_idx = f1_scores.argmax()
-        best_threshold = thresholds[best_idx]
-        
-        y_pred_tuned = (y_pred_proba > best_threshold).astype(int)
-        
+        f1_scores     = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+        best_idx      = f1_scores.argmax()
+        best_threshold = float(thresholds[best_idx])
+
+        y_pred_tuned = (y_pred_proba >= best_threshold).astype(int)
+
         mlflow.log_metrics({
-            'auc_roc': auc,
-            'f1': f1_score(y_test, y_pred_tuned),
+            'auc_roc':   auc,
+            'f1':        f1_score(y_test, y_pred_tuned),
             'precision': precision_score(y_test, y_pred_tuned),
-            'recall': recall_score(y_test, y_pred_tuned),
-            'threshold': best_threshold
+            'recall':    recall_score(y_test, y_pred_tuned),
+            'threshold': best_threshold,
         })
 
         signature = infer_signature(X_test, y_pred_proba)
@@ -146,11 +152,12 @@ def retrain_model(**context):
             signature=signature,
         )
 
+        # Tag DVC commit untuk reproducibility
         try:
             dvc_hash = subprocess.check_output(
                 ['git', 'log', '--format=%H', '-1', DVC_PATH],
                 cwd='/opt/airflow',
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
             ).decode().strip()
         except Exception:
             dvc_hash = 'unknown'
@@ -158,23 +165,43 @@ def retrain_model(**context):
 
         run_id = mlflow.active_run().info.run_id
 
+        # Champion/Challenger: promote jika AUC di atas minimum
+        promoted = False
         try:
             version  = register_model(run_id, version_alias='staging')
             promoted = champion_challenger(version, auc)
             mlflow.set_tag('promoted', str(promoted).lower())
-            if promoted:
-                model.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
-        except Exception as e:
-            if auc > 0.8445:
-                model.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
+        except Exception:
+            promoted = auc >= MIN_AUC_TO_PROMOTE
+
+        if promoted:
+            model.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
+
+            # Simpan threshold ke model_config.json agar API dan batch
+            # scoring bisa load threshold yang sama — tidak ada nilai hardcode
+            model_config = {
+                'churn_threshold': best_threshold,
+                'auc_roc':         round(auc, 6),
+                'trained_at':      datetime.now().isoformat(),
+                'mlflow_run_id':   run_id,
+            }
+            with open(MODEL_DIR / 'model_config.json', 'w') as f:
+                json.dump(model_config, f, indent=2)
+
+            mlflow.log_artifact(str(MODEL_DIR / 'model_config.json'))
+            print(f"Model promoted. threshold={best_threshold:.4f}  auc={auc:.4f}")
+        else:
+            print(f"Model NOT promoted. auc={auc:.4f} < required={MIN_AUC_TO_PROMOTE}")
 
     mlflow.lightgbm.autolog(disable=True)
 
+    # Hapus drift flag setelah retrain selesai
     drift_flag = '/opt/airflow/data/processed/drift_detected.flag'
     if os.path.exists(drift_flag):
         os.remove(drift_flag)
 
     return auc
+
 
 with DAG(
     'retrain_pipeline',
@@ -188,8 +215,8 @@ with DAG(
     tags=['retrain', 'mlops'],
 ) as dag:
 
-    check_drift   = PythonOperator(task_id='check_drift',    python_callable=check_drift_trigger)
-    validate_hash = PythonOperator(task_id='validate_dvc',   python_callable=validate_dvc_hash)
-    retrain       = PythonOperator(task_id='retrain_model',  python_callable=retrain_model)
+    check_drift   = PythonOperator(task_id='check_drift',   python_callable=check_drift_trigger)
+    validate_hash = PythonOperator(task_id='validate_dvc',  python_callable=validate_dvc_hash)
+    retrain       = PythonOperator(task_id='retrain_model', python_callable=retrain_model)
 
     check_drift >> validate_hash >> retrain
