@@ -1,14 +1,20 @@
+.env
 __pycache__/
 *.pyc
-*.pyo
-.env
-data/raw/*
-mlruns/
-*.egg-info/
 .ipynb_checkpoints/
-.DS_Store
 logs/
 mlflow_artifacts/
-mlflow_artifacts/
+mlruns/
 custormer_churn/
-data/raw/
+
+# Chặn toàn bộ data và artifacts
+data/
+outputs/
+*.pkl
+*.txt
+*.csv
+*.png
+*.html
+
+# Giữ lại cấu hình
+!requirements.txt

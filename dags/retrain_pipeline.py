@@ -12,7 +12,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, precision_recall_curve, f1_score, precision_score, recall_score
 import sys
 
 sys.path.insert(0, '/opt/airflow')
@@ -31,18 +31,14 @@ DVC_PATH  = '/opt/airflow/data/processed/features_latest.csv.dvc'
 def check_drift_trigger(**context):
     drift_flag = '/opt/airflow/data/processed/drift_detected.flag'
     if os.path.exists(drift_flag):
-        print("Drift flag found ✅")
         return True
-    print("No drift — skipping retrain")
     return False
 
 def validate_dvc_hash(**context):
-    """Ghost Data check — đảm bảo data đã được DVC version"""
     trigger = context['task_instance'].xcom_pull(task_ids='check_drift')
     if not trigger:
         return None
 
-    # Đọc expected MD5 từ .dvc file
     expected_md5 = None
     try:
         with open(DVC_PATH, 'r') as f:
@@ -51,13 +47,11 @@ def validate_dvc_hash(**context):
                     expected_md5 = line.split(':')[1].strip()
                     break
     except FileNotFoundError:
-        print("⚠️  No .dvc file found — skipping hash check")
         return True
 
     if not expected_md5:
         raise ValueError(".dvc file missing md5 field")
 
-    # Tính MD5 thực tế
     md5_hash = hashlib.md5()
     with open(CSV_PATH, 'rb') as f:
         for chunk in iter(lambda: f.read(4096), b''):
@@ -72,13 +66,11 @@ def validate_dvc_hash(**context):
             f"Run 'dvc add' + 'git commit' before retrain."
         )
 
-    print(f"DVC hash check passed ✅ — {actual_md5[:8]}")
     return True
 
 def retrain_model(**context):
     trigger = context['task_instance'].xcom_pull(task_ids='check_drift')
     if not trigger:
-        print("No retrain needed")
         return None
 
     df = pd.read_csv(CSV_PATH)
@@ -107,7 +99,6 @@ def retrain_model(**context):
     mlflow.set_tracking_uri(os.getenv('MLFLOW_TRACKING_URI'))
     mlflow.set_experiment('churn-prediction')
 
-    # Auto-log không có feature importance để tránh lỗi
     mlflow.lightgbm.autolog(
         log_input_examples=True,
         log_model_signatures=True,
@@ -128,18 +119,33 @@ def retrain_model(**context):
             callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)]
         )
 
-        auc = roc_auc_score(y_test, model.predict(X_test))
-        mlflow.log_metric('auc_roc', auc)
+        # Tính toán metric chi tiết
+        y_pred_proba = model.predict(X_test)
+        auc = roc_auc_score(y_test, y_pred_proba)
+        
+        # Tìm threshold tối ưu dựa trên F1
+        precisions, recalls, thresholds = precision_recall_curve(y_test, y_pred_proba)
+        f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+        best_idx = f1_scores.argmax()
+        best_threshold = thresholds[best_idx]
+        
+        y_pred_tuned = (y_pred_proba > best_threshold).astype(int)
+        
+        mlflow.log_metrics({
+            'auc_roc': auc,
+            'f1': f1_score(y_test, y_pred_tuned),
+            'precision': precision_score(y_test, y_pred_tuned),
+            'recall': recall_score(y_test, y_pred_tuned),
+            'threshold': best_threshold
+        })
 
-        # Model signature
-        signature = infer_signature(X_test, model.predict(X_test))
+        signature = infer_signature(X_test, y_pred_proba)
         mlflow.lightgbm.log_model(
             lgb_model=model,
             artifact_path='lgbm_churn',
             signature=signature,
         )
 
-        # DVC data lineage tag
         try:
             dvc_hash = subprocess.check_output(
                 ['git', 'log', '--format=%H', '-1', DVC_PATH],
@@ -152,24 +158,18 @@ def retrain_model(**context):
 
         run_id = mlflow.active_run().info.run_id
 
-        # Champion/Challenger
         try:
             version  = register_model(run_id, version_alias='staging')
             promoted = champion_challenger(version, auc)
             mlflow.set_tag('promoted', str(promoted).lower())
             if promoted:
                 model.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
-                print(f"✅ Promoted — AUC={auc:.4f}")
-            else:
-                print(f"❌ Not promoted — AUC={auc:.4f}")
         except Exception as e:
-            print(f"Registry error (non-critical): {e}")
             if auc > 0.8445:
                 model.save_model(str(MODEL_DIR / 'lgbm_churn.txt'))
 
     mlflow.lightgbm.autolog(disable=True)
 
-    # Clear drift flag
     drift_flag = '/opt/airflow/data/processed/drift_detected.flag'
     if os.path.exists(drift_flag):
         os.remove(drift_flag)

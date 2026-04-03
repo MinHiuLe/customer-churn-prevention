@@ -16,3 +16,5 @@ pytest==8.0.0
 python-dotenv==1.0.1
 lifelines==0.28.0
 scikit-survival==0.22.2
+dvc
+python-dotenv>=1.0.0

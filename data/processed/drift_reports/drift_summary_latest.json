@@ -1,8 +1,0 @@
-{
-  "timestamp": "20260323_223902",
-  "drift_score": 0.0,
-  "n_drifted_columns": 0,
-  "n_total_columns": 12,
-  "drift_detected": false,
-  "threshold": 0.3
-}
